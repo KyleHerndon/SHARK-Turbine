@@ -68,6 +68,55 @@ class TransposedMMMatcher(NamedOpMatcher):
             ),
         )
 
+class AWQMMResult(OpMatchResult):
+    def __init__(
+        self,
+        op: Operation,
+        *,
+        m: Optional[int],
+        n: Optional[int],
+        k: Optional[int],
+        element_type: IrType,
+    ):
+        super().__init__(op)
+        self.m = m
+        self.n = n
+        self.k = k
+        self.element_type = element_type
+
+    def __repr__(self):
+        return f"AWQMM(weight={self.param_name}, m={self.m}, n={self.n}, k={self.k}, element_type={self.element_type})"
+
+
+class AWQMMMatcher(NamedOpMatcher):
+    def __init__(self,  builder: Builder):
+        super().__init__("torch.operator")
+        self.builder = builder
+
+    def match(self, op: Operation):
+        if str(op.attributes["name"]) != "\"torch.turbine.awq_mm\"":
+            return None
+
+        print("operands")
+        print(self.builder.get_tensor_dims(op.operands[0].type))
+        print(self.builder.get_tensor_element_type(op.operands[0].type))
+        print(self.builder.get_tensor_dims(op.operands[1].type))
+        print(self.builder.get_tensor_element_type(op.operands[1].type))
+        print(self.builder.get_tensor_dims(op.operands[2].type))
+        print(self.builder.get_tensor_element_type(op.operands[2].type))
+        print(self.builder.get_tensor_dims(op.operands[3].type))
+        print(self.builder.get_tensor_element_type(op.operands[3].type))
+        m, n = self.builder.get_tensor_dims(op.operands[0].type)
+        _, k = self.builder.get_tensor_dims(op.operands[1].type)
+        return AWQMMResult(
+            op,
+            m=m,
+            n=n,
+            k=k,
+            element_type=self.builder.get_tensor_element_type(
+                op.operands[0].type
+            ),
+        )
 
 # TODO (ian): Make more generalizable using RenameParametersPass. Currently hardcoded for brevitas quantization
 GROUP_MATMUL_TEMPLATE = r"""
@@ -125,6 +174,53 @@ module {{
 }}
 """
 
+AWQ_GROUP_MATMUL_TEMPLATE = r"""
+module {{
+  func.func private @compute_awq_mm_group_quant_{m}_{n}_{k}(%inputs : tensor<{m}x{n}x{element_type}>, %weight_raw : tensor<{k}x{n_div}xi8>, %scale : tensor<{k}x{group0}x{element_type}>, %zp : tensor<{k}x{group0}x{element_type}>) -> tensor<{m}x{k}x{element_type}> {{
+    %c0 = arith.constant 0 : index        
+    %m = tensor.dim %inputs, %c0 : tensor<{m}x{n}x{element_type}>
+    %k = tensor.dim %weight_raw, %c0 : tensor<{k}x{n_div}xi8>
+    %weight = flow.tensor.bitcast %weight_raw : tensor<{k}x{n_div}xi8> -> tensor<{k}x{n}x{lowp_type}>
+    %inputs_exp = tensor.expand_shape %inputs [[0], [1, 2]] : tensor<{m}x{n}x{element_type}> into tensor<{m}x{group0}x{group1}x{element_type}>
+    %weight_exp = tensor.expand_shape %weight [[0], [1, 2]] : tensor<{k}x{n}x{lowp_type}> into tensor<{k}x{group0}x{group1}x{lowp_type}>
+    %empty_0 = tensor.empty() : tensor<{k}x{group0}x{group1}x{element_type}>
+    %weight_cast = linalg.generic {{
+        indexing_maps = [
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>, 
+            affine_map<(d0, d1, d2) -> (d0, d1)>, 
+            affine_map<(d0, d1, d2) -> (d0, d1)>, 
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>], 
+        iterator_types = ["parallel", "parallel", "parallel"] }} 
+        ins(%weight_exp, %scale, %zp : tensor<{k}x{group0}x{group1}x{lowp_type}>, tensor<{k}x{group0}x{element_type}>, tensor<{k}x{group0}x{element_type}>) 
+        outs(%empty_0 : tensor<{k}x{group0}x{group1}x{element_type}>) {{
+    ^bb0(%in: {lowp_type}, %in_1: {element_type}, %in_2: {element_type}, %out: {element_type}):
+        %16 = arith.extui %in : {lowp_type} to i32
+        %17 = arith.uitofp %16 : i32 to {element_type}
+        %18 = arith.subf %17, %in_2 : {element_type}
+        %19 = arith.mulf %18, %in_1 : {element_type}
+        linalg.yield %19 : {element_type}
+    }} -> tensor<{k}x{group0}x{group1}x{element_type}>
+    %cst = arith.constant 0.000000e+00 : {element_type}
+    %empty_1_dyn = tensor.empty(%m, %k) : tensor<?x?x{element_type}>
+    %empty_1 = tensor.cast %empty_1_dyn : tensor<?x?x{element_type}> to tensor<{m}x{k}x{element_type}>
+    %zero_init = linalg.fill ins(%cst : {element_type}) outs(%empty_1 : tensor<{m}x{k}x{element_type}>) -> tensor<{m}x{k}x{element_type}>
+    %result = linalg.generic {{
+        indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d1, d2, d3)>, 
+            affine_map<(d0, d1, d2, d3) -> (d0, d1)>], 
+        iterator_types = ["parallel", "parallel", "reduction", "reduction"] }} 
+        ins(%inputs_exp, %weight_cast : tensor<{m}x{group0}x{group1}x{element_type}>, tensor<{k}x{group0}x{group1}x{element_type}>) 
+        outs(%zero_init : tensor<{m}x{k}x{element_type}>) {{
+    ^bb0(%in: {element_type}, %in_1: {element_type}, %out: {element_type}):
+        %16 = arith.mulf %in, %in_1 : {element_type}
+        %17 = arith.addf %16, %out : {element_type}
+        linalg.yield %17 : {element_type}
+    }} -> tensor<{m}x{k}x{element_type}>
+    return %result : tensor<{m}x{k}x{element_type}>
+  }}
+}}
+"""
 
 class MMGroupQuantRewriterPass(Pass):
     def __init__(self, root_op: Operation, *, group_size: int = 128):
@@ -177,6 +273,59 @@ class MMGroupQuantRewriterPass(Pass):
                 )
                 self.replace_op(mr.op, *results)
 
+class AWQMMGroupQuantRewriterPass(Pass):
+    def __init__(self, root_op: Operation, *, group_size: int = 128):
+        super().__init__(root_op)
+        self.group_size = group_size
+        self.root_op = root_op
+        self.context = root_op.context
+
+    def run(self):
+        print("Testing TODO")
+        mms = match_children(
+            self.funcs, AWQMMMatcher(self.builder)
+        )
+
+        for mr in mms:
+            if mr.k is None or mr.n is None:
+                continue
+            if (mr.k % self.group_size) != 0:
+                continue
+            self.rewrite(mr)
+
+        self.inline()
+        self.cleanup()
+
+    def rewrite(self, mr: AWQMMResult):
+        none_to_q = lambda x: "?" if x is None else x
+        print("Hello! TODO: REMOVE THIS")
+        inline_module_asm = AWQ_GROUP_MATMUL_TEMPLATE.format(
+            lowp_type="i4",
+            m=none_to_q(mr.m),
+            n=none_to_q(mr.n),
+            k=none_to_q(mr.k),
+            n_div=mr.n // 2,
+            group0=mr.n // self.group_size,
+            group1=self.group_size,
+            element_type=mr.element_type,
+        )
+
+        inline_module = Operation.parse(
+            inline_module_asm, context=self.context
+        )
+        func_name = "compute_awq_mm_group_quant_{m}_{n}_{k}".format(
+                m=none_to_q(mr.m),
+                n=none_to_q(mr.n),
+                k=none_to_q(mr.k)
+        )
+        actual_callee_name = self.merge_module(
+            inline_module
+        ).translate_symbol(func_name)
+        with InsertionPoint(mr.op), mr.op.location:
+            results = self.builder.call_native(
+                actual_callee_name, [mr.op.result.type], mr.op.operands[0], mr.op.operands[1], mr.op.operands[2], mr.op.operands[3]
+            )
+            self.replace_op(mr.op, *results)
 
 if __name__ == "__main__":
     pass_main(MMGroupQuantRewriterPass)

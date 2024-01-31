@@ -67,7 +67,7 @@ class CustomOp(ABC):
         library: torch.library.Library = TURBINE_LIBRARY,
         dispatch_key: str = "",
         register_meta: bool = True,
-        register_impl: bool = True,
+        register_impl: bool = False,
     ) -> Callable:
         """Class decorator for `CustomOp` implementations.
 
